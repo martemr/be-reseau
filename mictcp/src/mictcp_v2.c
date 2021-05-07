@@ -1,29 +1,21 @@
-/** Version 3 du protocole mictcp :
- *  Garantie de fiabilité partielle « statique » via un mécanisme de reprise des pertes 
- *      de type « Stop and Wait » à fiabilité partielle « pré câblée », 
- *      i.e. dont le % de pertes admissibles est défini de façon statique.
+/** Version 2 du protocole mictcp :
+ *  Garantie de fiabilité totale via un mécanisme de reprise des pertes 
+ *      de type « Stop and Wait ». 
  * 
  *  On envoie donc un message et attend de recevoir l'ack. 
- *      Si il n'est pas recu, on verifie la tolérance et renvoie si besoin. 
- *      Si il est recu et pas conforme à ce attendu, on renvoie systématique le message.
+ *      Si il n'est pas recu ou incorrect, on renvoie. 
  *  
- *  Par ailleurs, dans cette version, nous ne ferons plus de modulo 2 sur le numero de séquence et d'acquisition.
- *  Cela permet d'éviter l'erreur causé par un saut de message.
- *  Une amélioration de ce programme pourrait etre une remise à zéro des compteurs au bout d'un certain nombre d'envois, pour ne pas épuiser la mémoire.
  */
 #include <mictcp.h>
 #include <api/mictcp_core.h>
+#include <time.h>
 
-#define LOSS_RATE 60  // En pourcentage, taux de perte fixé
-#define TOLERANCE 0.5 // Seuil de tolérance = pertes admises (0=0%; 1=100%)
+#define LOSS_RATE 50  // En pourcentage, taux de perte fixé
 
 mic_tcp_sock socket_local; 
 
 int num_sequence=0;
-int num_aquisition=0;
-
-double compt_env=0;
-double compt_rec=0;
+int num_attendu=0;
 
 /*
  * Permet de créer un socket entre l’application et MIC-TCP
@@ -32,9 +24,9 @@ double compt_rec=0;
 int mic_tcp_socket(start_mode sm)
 {
     printf("[MIC-TCP] Appel de la fonction: ");  printf(__FUNCTION__); printf("\n");
-   
+    
     if(initialize_components(sm)==-1){
-       printf("Erreur initialise components \n");
+        printf("Erreur initialise components \n");
     }
     set_loss_rate(LOSS_RATE);
 
@@ -82,11 +74,11 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 {
     printf("[MIC-TCP] Appel de la fonction: "); printf(__FUNCTION__); printf("\n");
-    
+
     // Vérifier qu'on est connecté
     if (socket_local.state!=ESTABLISHED) printf("Erreur : Connection non établie \n");     
-    
-    /* Encapsulation du message */
+
+    /* Encapsulation */
     mic_tcp_pdu pdu;
         // Header
     pdu.header.seq_num=num_sequence;
@@ -103,40 +95,29 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
     pdu_ack.payload.size=0;
     pdu_ack.header.ack_num=num_sequence;
 
-    /* Attente de l'ACK */
-    int sent_size;  // Taille du paquet envoyé
-    compt_env++; // Incrémente le compteur d'envois
+    num_sequence=(num_sequence+1)%2; // Mise à jour du numéro de séquence
 
-    while(pdu_ack.header.ack_num!=(num_sequence+1)){ // Regarde le numero de l'ack change ce numéro change => ack reçu
+    /* Attente de l'ACK */
+    int sent_size;
+    while(pdu_ack.header.ack_num!=num_sequence){ // Regarde si le numéro reçu est correct
 
         // Envoi pdu
         sent_size=IP_send(pdu, socket_local.addr);
-        if (sent_size==-1){
+        if (sent_size==-1) {
             printf("Erreur d'envoi \n");
             exit(1);
         }
 
         // Attente d'expiration du timer ou ack reçu
-        if (IP_recv(&pdu_ack, &socket_local.addr, 10)==-1){ // Timer à 10ms
-            double perte=1-(compt_rec/compt_env); // Taux de perte = Taux d'echecs
-            printf("Timer expiré : paquet perdu \n");
-            if (perte>TOLERANCE){
-                printf(" ->Perte non tolérée : %f > %f \n", perte, 1-TOLERANCE);
-                continue; // On renvoie
-            } else {
-                printf(" ->Perte tolérée : %f <= %f \n", perte, 1-TOLERANCE);
-                break; // On s'arrete ici
-            }
-        } else if (pdu_ack.header.ack_num==num_sequence+1){ // Ack recu et bonne valeur
-            printf("Message correctement envoyé et reçu\n");
-            compt_rec++;
-        } // Sinon, cela signifie que l'ack recu est non conforme, on reboucle donc
-        else {
-        printf("Ack recu = %d ", pdu_ack.header.ack_num);
+        if (IP_recv(&pdu_ack, &socket_local.addr, 10)==-1){
+            printf("Paquet perdu, on renvoie \n");
+        } else {
+            break;
         }
     }
-    // Mise à jour du numéro de séquence
-    num_sequence=(num_sequence+1);
+
+    printf("Message bien envoyé ! \n");
+
     return sent_size;
 }
 
@@ -180,21 +161,20 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 {
     printf("[MIC-TCP] Appel de la fonction: "); printf(__FUNCTION__); printf("\n");
     
+    /* Créé le pdu qui sera envoyé */
     mic_tcp_pdu pdu_ack;
-    pdu_ack.payload.size=0; // Ce pdu ne sert qu'a envoyer l'ack, donc pas de payload
+    pdu_ack.payload.size=0;
+    pdu_ack.header.ack_num=pdu.header.ack_num;
     
     // Teste la reception du bon message
-    if (pdu.header.seq_num>=num_aquisition){ // Si j'ai reçu le bon message
+    if (pdu.header.seq_num==num_attendu){
         app_buffer_put(pdu.payload);
-        pdu_ack.header.ack_num=(pdu.header.seq_num+1); // Met à jour l'ack
-        num_aquisition=(pdu.header.seq_num+1); // Met à jour le num attendu
-    } else {
-        pdu_ack.header.ack_num=num_aquisition; // Sinon, met à jour l'ack pour contrer la perte d'ack (j'ai deja recu ce message donc renvoie l'ack d'avant)
+        num_attendu=(num_attendu+1)%2; // Met à jour le num attendu
+        pdu_ack.header.ack_num=(pdu.header.ack_num+1)%2; // Met à jour l'ack
     }
 
-    if (IP_send(pdu_ack, socket_local.addr)==-1){// Envoi l'ack
-        printf("Erreur dans l'envoi de l'ack \n");
+    if (IP_send(pdu_ack, socket_local.addr)==-1){ // Envoi l'ack
+        printf("Erreur lors de l'envoi de l'ack \n");
         exit(1);
     }
-
 }
